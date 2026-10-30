@@ -1,0 +1,68 @@
+---
+- name: Remove Kubernetes AWS resources
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+    - vars.yml
+  module_defaults:
+    group/aws:
+      region: "{{ aws_region }}"
+  tasks:
+    - name: Require explicit destruction confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_k8s_destroy | default(false) | bool
+        fail_msg: "Re-run with -e confirm_k8s_destroy=true to delete the Kubernetes load balancer, target groups, nodes, and security group."
+
+    - name: Delete Kubernetes network load balancer
+      community.aws.elb_network_lb:
+        name: "{{ k8s_load_balancer_name }}"
+        state: absent
+        wait: true
+
+    - name: Delete API target group
+      community.aws.elb_target_group:
+        name: "{{ k8s_api_target_group }}"
+        state: absent
+
+    - name: Delete HTTP target group
+      community.aws.elb_target_group:
+        name: "{{ k8s_http_target_group }}"
+        state: absent
+
+    - name: Delete HTTPS target group
+      community.aws.elb_target_group:
+        name: "{{ k8s_https_target_group }}"
+        state: absent
+
+    - name: Terminate tagged Kubernetes instances
+      amazon.aws.ec2_instance:
+        state: absent
+        wait: true
+        filters:
+          "tag:Project": "{{ k8s_project_tag }}"
+          instance-state-name: [pending, running, stopping, stopped]
+
+    - name: Remove Kubernetes node security group
+      amazon.aws.ec2_security_group:
+        name: "{{ k8s_sg_name }}"
+        vpc_id: "{{ vpc_id }}"
+        state: absent
+
+    - name: Remove Route 53 dashboard record when configured
+      amazon.aws.route53:
+        hosted_zone_id: "{{ k8s_route53_zone_id }}"
+        record: "{{ k8s_headlamp_domain }}"
+        type: CNAME
+        state: absent
+      when: k8s_route53_zone_id | length > 0
+
+    - name: Remove Route 53 Argo CD record when configured
+      amazon.aws.route53:
+        hosted_zone_id: "{{ k8s_route53_zone_id }}"
+        record: "{{ k8s_argocd_domain }}"
+        type: CNAME
+        state: absent
+      when: k8s_route53_zone_id | length > 0

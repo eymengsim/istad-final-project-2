@@ -1,0 +1,389 @@
+---
+- name: Provision AWS hosts and bootstrap Kubernetes with Kubespray
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+    - vars.yml
+  module_defaults:
+    group/aws:
+      region: "{{ aws_region }}"
+  tasks:
+    - name: Validate required HA cluster settings
+      ansible.builtin.assert:
+        that:
+          - k8s_ami_id | length > 0
+          - k8s_admin_cidr | length > 0
+          - k8s_admin_cidr != '0.0.0.0/0'
+          - k8s_vpc_cidr | length > 0
+          - k8s_subnet_ids | length == 3
+          - key_path is file
+        fail_msg: >-
+          Set k8s_ami_id, k8s_admin_cidr, k8s_vpc_cidr and three
+          k8s_subnet_ids in kubernetes/vars.yml, and ensure the SSH key exists.
+
+    - name: Inspect cluster subnets
+      amazon.aws.ec2_vpc_subnet_info:
+        filters:
+          subnet-id: "{{ k8s_subnet_ids }}"
+      register: k8s_subnets
+
+    - name: Require subnets in three distinct availability zones
+      ansible.builtin.assert:
+        that:
+          - k8s_subnets.subnets | length == 3
+          - (k8s_subnets.subnets | map(attribute='availability_zone') | unique | list | length) == 3
+          - (k8s_subnets.subnets | selectattr('vpc_id', 'ne', vpc_id) | list | length) == 0
+        fail_msg: "Provide three valid subnets in three distinct availability zones."
+
+    - name: Create Kubernetes node security group
+      amazon.aws.ec2_security_group:
+        name: "{{ k8s_sg_name }}"
+        description: Kubernetes nodes and ingress for {{ k8s_cluster_name }}
+        vpc_id: "{{ vpc_id }}"
+        rules:
+          - proto: tcp
+            ports: [22]
+            cidr_ip: "{{ k8s_admin_cidr }}"
+            rule_desc: SSH from administrator network
+          - proto: tcp
+            ports: [6443]
+            cidr_ip: "{{ k8s_admin_cidr }}"
+            rule_desc: Kubernetes API access from administrator network
+          - proto: tcp
+            ports: [6443, 30080, 30443]
+            cidr_ip: "{{ k8s_vpc_cidr }}"
+            rule_desc: Load balancer health checks and node traffic
+          - proto: -1
+            group_name: "{{ k8s_sg_name }}"
+            rule_desc: Node-to-node Kubernetes traffic
+        tags:
+          Project: "{{ k8s_project_tag }}"
+
+    - name: Find existing tagged Kubernetes nodes
+      amazon.aws.ec2_instance_info:
+        filters:
+          "tag:Project": "{{ k8s_project_tag }}"
+          "tag:KubernetesCluster": "{{ k8s_cluster_name }}"
+      register: k8s_existing
+
+    - name: Validate existing node instances
+      ansible.builtin.assert:
+        that:
+          - (k8s_existing.instances | map(attribute='tags.Name') | difference(k8s_nodes | map(attribute='name') | list) | list | length) == 0
+          - (k8s_existing.instances | selectattr('state.name', 'ne', 'running') | list | length) == 0
+          - (k8s_existing.instances | map(attribute='tags.Name') | unique | list | length) == (k8s_existing.instances | length)
+          - (k8s_existing.instances | selectattr('public_ip_address', 'undefined') | list | length) == 0
+          - (k8s_existing.instances | selectattr('private_ip_address', 'undefined') | list | length) == 0
+        fail_msg: >-
+          Existing tagged nodes must match the configured names and be running.
+          Resolve stopped or unexpected instances before provisioning.
+
+    - name: Launch Kubernetes control-plane and worker nodes
+      amazon.aws.ec2_instance:
+        name: "{{ item.name }}"
+        key_name: "{{ key_name }}"
+        instance_type: "{{ k8s_instance_type }}"
+        image_id: "{{ k8s_ami_id }}"
+        vpc_subnet_id: "{{ k8s_subnet_ids[item.subnet_index] }}"
+        security_group: "{{ k8s_sg_name }}"
+        network:
+          assign_public_ip: true
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_size: "{{ k8s_disk_size }}"
+              volume_type: gp3
+              delete_on_termination: true
+        tags:
+          Project: "{{ k8s_project_tag }}"
+          Role: "{{ item.role }}"
+          KubernetesCluster: "{{ k8s_cluster_name }}"
+        state: running
+        wait: true
+      loop: "{{ k8s_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: (k8s_existing.instances | selectattr('tags.Name', 'equalto', item.name) | list | length) == 0
+      register: k8s_launch
+
+    - name: Initialize node inventory data
+      ansible.builtin.set_fact:
+        k8s_inventory_nodes: []
+
+    - name: Add existing nodes to inventory data
+      ansible.builtin.set_fact:
+        k8s_inventory_nodes: >-
+          {{
+            k8s_inventory_nodes +
+            [{
+              'name': item.tags.Name,
+              'role': item.tags.Role,
+              'public_ip': item.public_ip_address,
+              'private_ip': item.private_ip_address,
+              'api_target': {'Id': item.private_ip_address, 'Port': 6443},
+              'http_target': {'Id': item.private_ip_address, 'Port': 30080},
+              'https_target': {'Id': item.private_ip_address, 'Port': 30443}
+            }]
+          }}
+      loop: "{{ k8s_existing.instances }}"
+      loop_control:
+        label: "{{ item.tags.Name }}"
+
+    - name: Add newly launched nodes to inventory data
+      ansible.builtin.set_fact:
+        k8s_inventory_nodes: >-
+          {{
+            k8s_inventory_nodes +
+            [{
+              'name': item.item.name,
+              'role': item.item.role,
+              'public_ip': item.instances[0].public_ip_address,
+              'private_ip': item.instances[0].private_ip_address,
+              'api_target': {'Id': item.instances[0].private_ip_address, 'Port': 6443},
+              'http_target': {'Id': item.instances[0].private_ip_address, 'Port': 30080},
+              'https_target': {'Id': item.instances[0].private_ip_address, 'Port': 30443}
+            }]
+          }}
+      loop: "{{ k8s_launch.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: not (item.skipped | default(false))
+
+    - name: Validate complete six-node inventory
+      ansible.builtin.assert:
+        that:
+          - k8s_inventory_nodes | length == k8s_nodes | length
+          - (k8s_inventory_nodes | map(attribute='name') | unique | list | length) == (k8s_nodes | length)
+        fail_msg: "The generated inventory must contain exactly one running instance for each configured cluster node."
+
+    - name: Add new hosts to the current Ansible run
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: "{{ ['k8s_cluster', item.role] + (['etcd'] if item.role == 'kube_control_plane' else []) }}"
+        ansible_host: "{{ item.public_ip }}"
+        ansible_user: "{{ common_user }}"
+        ansible_ssh_private_key_file: "{{ key_path }}"
+        ip: "{{ item.private_ip }}"
+        access_ip: "{{ item.private_ip }}"
+      loop: "{{ k8s_inventory_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Render Kubespray inventory
+      ansible.builtin.template:
+        src: templates/hosts.yml.j2
+        dest: "{{ k8s_inventory_path }}"
+        mode: "0600"
+
+    - name: Create API target group
+      community.aws.elb_target_group:
+        name: "{{ k8s_api_target_group }}"
+        protocol: tcp
+        port: 6443
+        target_type: ip
+        vpc_id: "{{ vpc_id }}"
+        preserve_client_ip_enabled: true
+        health_check_protocol: tcp
+        targets: >-
+          {{ k8s_inventory_nodes | selectattr('role', 'equalto', 'kube_control_plane') | map(attribute='api_target') | list }}
+        state: present
+
+    - name: Create web ingress target group
+      community.aws.elb_target_group:
+        name: "{{ k8s_http_target_group }}"
+        protocol: tcp
+        port: 30080
+        target_type: ip
+        vpc_id: "{{ vpc_id }}"
+        preserve_client_ip_enabled: false
+        health_check_protocol: tcp
+        targets: >-
+          {{ k8s_inventory_nodes | selectattr('role', 'equalto', 'kube_node') | map(attribute='http_target') | list }}
+        state: present
+
+    - name: Create secure ingress target group
+      community.aws.elb_target_group:
+        name: "{{ k8s_https_target_group }}"
+        protocol: tcp
+        port: 30443
+        target_type: ip
+        vpc_id: "{{ vpc_id }}"
+        preserve_client_ip_enabled: false
+        health_check_protocol: tcp
+        targets: >-
+          {{ k8s_inventory_nodes | selectattr('role', 'equalto', 'kube_node') | map(attribute='https_target') | list }}
+        state: present
+
+    - name: Create public network load balancer
+      community.aws.elb_network_lb:
+        name: "{{ k8s_load_balancer_name }}"
+        subnets: "{{ k8s_subnet_ids }}"
+        scheme: internet-facing
+        cross_zone_load_balancing: true
+        listeners:
+          - Protocol: TCP
+            Port: 6443
+            DefaultActions:
+              - Type: forward
+                TargetGroupName: "{{ k8s_api_target_group }}"
+          - Protocol: TCP
+            Port: 80
+            DefaultActions:
+              - Type: forward
+                TargetGroupName: "{{ k8s_http_target_group }}"
+          - Protocol: TCP
+            Port: 443
+            DefaultActions:
+              - Type: forward
+                TargetGroupName: "{{ k8s_https_target_group }}"
+        tags:
+          Project: "{{ k8s_project_tag }}"
+        state: present
+        wait: true
+      register: k8s_nlb
+
+    - name: Create Headlamp DNS CNAME in Route 53 when configured
+      amazon.aws.route53:
+        hosted_zone_id: "{{ k8s_route53_zone_id }}"
+        record: "{{ k8s_headlamp_domain }}"
+        type: CNAME
+        value:
+          - "{{ k8s_nlb.dns_name }}"
+        ttl: 300
+        overwrite: true
+        state: present
+      when: k8s_route53_zone_id | length > 0
+
+    - name: Create Argo CD DNS CNAME in Route 53 when configured
+      amazon.aws.route53:
+        hosted_zone_id: "{{ k8s_route53_zone_id }}"
+        record: "{{ k8s_argocd_domain }}"
+        type: CNAME
+        value:
+          - "{{ k8s_nlb.dns_name }}"
+        ttl: 300
+        overwrite: true
+        state: present
+      when: k8s_route53_zone_id | length > 0
+
+    - name: Set Kubernetes API endpoint
+      ansible.builtin.set_fact:
+        k8s_control_plane_endpoint: "{{ k8s_nlb.dns_name }}"
+
+    - name: Render Kubespray cluster variables
+      ansible.builtin.template:
+        src: templates/k8s-cluster.yml.j2
+        dest: "{{ playbook_dir }}/.cache/k8s-cluster.yml"
+        mode: "0600"
+
+    - name: Show load balancer DNS name
+      ansible.builtin.debug:
+        msg: "Kubernetes API and ingress load balancer: {{ k8s_nlb.dns_name }}"
+
+    - name: Wait for SSH on all nodes
+      ansible.builtin.wait_for:
+        host: "{{ item.public_ip }}"
+        port: 22
+        delay: 5
+        timeout: 600
+      loop: "{{ k8s_inventory_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Clone pinned Kubespray release
+      ansible.builtin.git:
+        repo: https://github.com/kubernetes-sigs/kubespray.git
+        dest: "{{ k8s_kubespray_path }}"
+        version: "{{ k8s_kubespray_version }}"
+        depth: 1
+
+    - name: Create Kubespray Python environment
+      ansible.builtin.command:
+        cmd: "python3 -m venv {{ k8s_venv_path }}"
+        creates: "{{ k8s_venv_path }}/bin/activate"
+
+    - name: Install Kubespray Python dependencies
+      ansible.builtin.pip:
+        requirements: "{{ k8s_kubespray_path }}/requirements.txt"
+        virtualenv: "{{ k8s_venv_path }}"
+
+    - name: Install deterministic password hashing dependency
+      ansible.builtin.pip:
+        name: "passlib[bcrypt]"
+        virtualenv: "{{ k8s_venv_path }}"
+
+    - name: Install Kubespray Ansible collections
+      ansible.builtin.command:
+        argv:
+          - "{{ k8s_venv_path }}/bin/ansible-galaxy"
+          - collection
+          - install
+          - -r
+          - requirements.yml
+        chdir: "{{ k8s_kubespray_path }}"
+
+    - name: Create Kubespray inventory directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ k8s_kubespray_path }}/inventory/cluster"
+        - "{{ k8s_kubespray_path }}/inventory/cluster/group_vars"
+
+    - name: Copy Kubespray sample group variables
+      ansible.builtin.copy:
+        src: "{{ k8s_kubespray_path }}/inventory/sample/group_vars/"
+        dest: "{{ k8s_kubespray_path }}/inventory/cluster/group_vars/"
+        remote_src: true
+
+    - name: Copy generated node inventory into Kubespray
+      ansible.builtin.copy:
+        src: "{{ k8s_inventory_path }}"
+        dest: "{{ k8s_kubespray_path }}/inventory/cluster/hosts.yaml"
+        mode: "0600"
+
+    - name: Copy Kubespray cluster configuration
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/.cache/k8s-cluster.yml"
+        dest: "{{ k8s_kubespray_path }}/inventory/cluster/group_vars/k8s_cluster/99-k8s-custom.yml"
+        mode: "0600"
+
+    - name: Run Kubespray against the new cluster
+      ansible.builtin.command:
+        argv:
+          - "{{ k8s_venv_path }}/bin/ansible-playbook"
+          - "-i"
+          - inventory/cluster/hosts.yaml
+          - "--become"
+          - cluster.yml
+        chdir: "{{ k8s_kubespray_path }}"
+      environment:
+        ANSIBLE_CONFIG: "{{ k8s_kubespray_path }}/ansible.cfg"
+
+    - name: Create local artifact directory
+      ansible.builtin.file:
+        path: "{{ k8s_artifacts_path }}"
+        state: directory
+        mode: "0700"
+
+- name: Retrieve kubeconfig from the first control-plane host
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Fetch cluster admin kubeconfig
+      ansible.builtin.fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ playbook_dir }}/artifacts/kubeconfig"
+        flat: true
+      delegate_to: "{{ groups['kube_control_plane'][0] }}"
+      become: true
+
+    - name: Restrict local kubeconfig permissions
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/artifacts/kubeconfig"
+        mode: "0600"
+        state: file

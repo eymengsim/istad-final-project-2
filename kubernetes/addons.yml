@@ -1,0 +1,218 @@
+---
+- name: Install cluster add-ons and GitOps application
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+    - vars.yml
+  vars:
+    kubeconfig_path: "{{ playbook_dir }}/artifacts/kubeconfig"
+    local_bin_path: "{{ lookup('env', 'HOME') }}/.local/bin"
+    helm_archive_path: "{{ playbook_dir }}/.cache/helm.tar.gz"
+    headlamp_values_path: "{{ playbook_dir }}/.cache/headlamp-values.yml"
+    argocd_values_path: "{{ playbook_dir }}/.cache/argocd-values.yml"
+    issuer_path: "{{ playbook_dir }}/.cache/letsencrypt-issuer.yml"
+    application_path: "{{ playbook_dir }}/.cache/argocd-application.yml"
+  tasks:
+    - name: Validate add-on configuration
+      ansible.builtin.assert:
+        that:
+          - kubeconfig_path is file
+          - k8s_argocd_password_hash | length > 0
+          - k8s_acme_email | length > 0
+          - k8s_gitops_repo_url is match('^https://')
+        fail_msg: >-
+          Run provision.yml first, then set ARGOCD_ADMIN_PASSWORD_HASH,
+          LE_EMAIL, and a valid HTTPS GitOps repository URL.
+
+    - name: Create local tool and cache directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ local_bin_path }}"
+        - "{{ playbook_dir }}/.cache"
+
+    - name: Install kubectl matching the cluster version
+      ansible.builtin.get_url:
+        url: "https://dl.k8s.io/release/v{{ k8s_kubernetes_version }}/bin/linux/amd64/kubectl"
+        dest: "{{ local_bin_path }}/kubectl"
+        mode: "0755"
+
+    - name: Download pinned Helm archive
+      ansible.builtin.get_url:
+        url: "https://get.helm.sh/helm-{{ k8s_helm_version }}-linux-amd64.tar.gz"
+        dest: "{{ helm_archive_path }}"
+        mode: "0644"
+
+    - name: Unpack Helm binary
+      ansible.builtin.unarchive:
+        src: "{{ helm_archive_path }}"
+        dest: "{{ playbook_dir }}/.cache"
+        remote_src: true
+
+    - name: Install Helm binary
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/.cache/linux-amd64/helm"
+        dest: "{{ local_bin_path }}/helm"
+        mode: "0755"
+        remote_src: true
+
+    - name: Render Headlamp values
+      ansible.builtin.template:
+        src: templates/headlamp-values.yml.j2
+        dest: "{{ headlamp_values_path }}"
+        mode: "0600"
+
+    - name: Render Argo CD values
+      ansible.builtin.template:
+        src: templates/argocd-values.yml.j2
+        dest: "{{ argocd_values_path }}"
+        mode: "0600"
+
+    - name: Render Let's Encrypt issuer configuration
+      ansible.builtin.template:
+        src: letsencrypt-issuer.yml
+        dest: "{{ issuer_path }}"
+        mode: "0600"
+
+    - name: Render Argo CD application configuration
+      ansible.builtin.template:
+        src: argocd-application.yml.j2
+        dest: "{{ application_path }}"
+        mode: "0600"
+
+    - name: Add Helm repositories
+      ansible.builtin.command:
+        argv:
+          - "{{ local_bin_path }}/helm"
+          - repo
+          - add
+          - "{{ item.name }}"
+          - "{{ item.url }}"
+          - --force-update
+      changed_when: false
+      loop:
+        - { name: jetstack, url: https://charts.jetstack.io }
+        - { name: traefik, url: https://traefik.github.io/charts }
+        - { name: headlamp, url: https://kubernetes-sigs.github.io/headlamp/ }
+        - { name: argo, url: https://argoproj.github.io/argo-helm }
+      environment:
+        PATH: "{{ local_bin_path }}:{{ lookup('env', 'PATH') }}"
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        argv: ["{{ local_bin_path }}/helm", repo, update]
+      environment:
+        PATH: "{{ local_bin_path }}:{{ lookup('env', 'PATH') }}"
+
+    - name: Install cert-manager
+      ansible.builtin.command:
+        argv:
+          - "{{ local_bin_path }}/helm"
+          - upgrade
+          - --install
+          - cert-manager
+          - jetstack/cert-manager
+          - --version
+          - v1.21.3
+          - --namespace
+          - cert-manager
+          - --create-namespace
+          - --set
+          - crds.enabled=true
+          - --wait
+      environment:
+        PATH: "{{ local_bin_path }}:{{ lookup('env', 'PATH') }}"
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Install Traefik ingress controller
+      ansible.builtin.command:
+        argv:
+          - "{{ local_bin_path }}/helm"
+          - upgrade
+          - --install
+          - traefik
+          - traefik/traefik
+          - --version
+          - 42.1.3
+          - --namespace
+          - traefik
+          - --create-namespace
+          - --values
+          - "{{ playbook_dir }}/helm-values/traefik.yml"
+          - --wait
+      environment:
+        PATH: "{{ local_bin_path }}:{{ lookup('env', 'PATH') }}"
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Install Headlamp dashboard
+      ansible.builtin.command:
+        argv:
+          - "{{ local_bin_path }}/helm"
+          - upgrade
+          - --install
+          - headlamp
+          - headlamp/headlamp
+          - --version
+          - 0.46.0
+          - --namespace
+          - headlamp
+          - --create-namespace
+          - --values
+          - "{{ headlamp_values_path }}"
+          - --wait
+      environment:
+        PATH: "{{ local_bin_path }}:{{ lookup('env', 'PATH') }}"
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Install Argo CD
+      ansible.builtin.command:
+        argv:
+          - "{{ local_bin_path }}/helm"
+          - upgrade
+          - --install
+          - argocd
+          - argo/argo-cd
+          - --version
+          - 10.11.6
+          - --namespace
+          - argocd
+          - --create-namespace
+          - --values
+          - "{{ argocd_values_path }}"
+          - --wait
+      environment:
+        PATH: "{{ local_bin_path }}:{{ lookup('env', 'PATH') }}"
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Create Let's Encrypt cluster issuer
+      ansible.builtin.command:
+        argv:
+          - "{{ local_bin_path }}/kubectl"
+          - apply
+          - --filename
+          - "{{ issuer_path }}"
+      environment:
+        PATH: "{{ local_bin_path }}:{{ lookup('env', 'PATH') }}"
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Create Argo CD frontend application
+      ansible.builtin.command:
+        argv:
+          - "{{ local_bin_path }}/kubectl"
+          - apply
+          - --filename
+          - "{{ application_path }}"
+      environment:
+        PATH: "{{ local_bin_path }}:{{ lookup('env', 'PATH') }}"
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Show load balancer DNS name for domain records
+      ansible.builtin.debug:
+        msg:
+          - "Create DNS records for {{ k8s_headlamp_domain }} and {{ k8s_argocd_domain }} pointing to the Kubernetes NLB."
+          - "The NLB hostname is printed by provision.yml; DNS must resolve before Let's Encrypt can issue certificates."

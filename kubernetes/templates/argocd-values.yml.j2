@@ -1,0 +1,16 @@
+---
+configs:
+  secret:
+    argocdServerAdminPassword: "{{ k8s_argocd_password_hash }}"
+
+server:
+  extraArgs:
+    - --insecure
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hostname: {{ k8s_argocd_domain }}
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt
+      traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    tls: true

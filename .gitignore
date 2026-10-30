@@ -1,0 +1,12 @@
+.cache/
+kubernetes/.cache/
+kubernetes/artifacts/
+kubernetes/inventory/hosts.yml
+.env
+.env.*
+*.pem
+*.key
+__pycache__/
+*.pyc
+app/node_modules/
+app/dist/

@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reactjs-app
+  labels:
+    app: reactjs-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: reactjs-app
+  template:
+    metadata:
+      labels:
+        app: reactjs-app
+    spec:
+      containers:
+        - name: reactjs-app
+          image: docker.io/mengsim/reactjs-app:1
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

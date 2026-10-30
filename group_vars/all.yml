@@ -1,0 +1,10 @@
+---
+region: ap-southeast-1
+vpc_id: vpc-079644a92dbfaaee5
+key_name: final-key
+key_path: "{{ lookup('env', 'HOME') }}/.ssh/final-key.pem"
+project_tag: final-project
+common_user: ubuntu
+subdomain_prefix: g12
+duckdns_suffix: duckdns.org
+le_email: "{{ lookup('env', 'LE_EMAIL') }}"

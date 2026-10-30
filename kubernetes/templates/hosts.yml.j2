@@ -1,0 +1,33 @@
+---
+all:
+  hosts:
+{% for node in k8s_inventory_nodes %}
+    {{ node.name }}:
+      ansible_host: {{ node.public_ip }}
+      ip: {{ node.private_ip }}
+      access_ip: {{ node.private_ip }}
+      ansible_user: {{ common_user }}
+      ansible_ssh_private_key_file: {{ key_path }}
+{% endfor %}
+  children:
+    kube_control_plane:
+      hosts:
+{% for node in k8s_inventory_nodes if node.role == 'kube_control_plane' %}
+        {{ node.name }}:
+{% endfor %}
+    etcd:
+      hosts:
+{% for node in k8s_inventory_nodes if node.role == 'kube_control_plane' %}
+        {{ node.name }}:
+{% endfor %}
+    kube_node:
+      hosts:
+{% for node in k8s_inventory_nodes if node.role == 'kube_node' %}
+        {{ node.name }}:
+{% endfor %}
+    k8s_cluster:
+      children:
+        kube_control_plane:
+        kube_node:
+    calico_rr:
+      hosts: {}

@@ -1,0 +1,7 @@
+---
+kube_version: v{{ k8s_kubernetes_version }}
+container_manager: containerd
+kube_network_plugin: calico
+kube_control_plane_endpoint: "{{ k8s_control_plane_endpoint }}"
+kube_proxy_mode: ipvs
+helm_enabled: false

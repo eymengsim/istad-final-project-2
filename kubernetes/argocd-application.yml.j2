@@ -1,0 +1,21 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: reactjs-frontend
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: "{{ k8s_gitops_repo_url }}"
+    targetRevision: "{{ k8s_gitops_revision }}"
+    path: gitops/k8s/overlays/prod
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
